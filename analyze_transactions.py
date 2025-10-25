@@ -126,6 +126,11 @@ def group_by_invoice(entries: List[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict
     non_invoice_entries: List[Dict[str, Any]] = []
     
     for entry in entries:
+        # Skip Motlinje (reversal) entries - treat them as separate income transactions
+        if "motlinje" in entry.get("description", "").lower():
+            non_invoice_entries.append(entry)
+            continue
+            
         invoice_num = extract_invoice_number(entry.get("description", ""))
         if invoice_num:
             if invoice_num not in invoice_groups:
