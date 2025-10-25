@@ -712,12 +712,23 @@ def generate_monthly_csv(monthly_data: Dict[str, Dict[str, Dict[str, Any]]]):
     out_path = f"fiken_monthly_analysis_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
     
+    # Define all possible categories
+    all_categories = ["Income", "Personalkostnader", "Programvare og datasystemer", "MVA", "ADK"]
+    
     for month in sorted(monthly_data.keys()):
-        for category, totals in sorted(monthly_data[month].items()):
-            inflow = totals["inflow"]
-            outflow = totals["outflow"]
-            net = inflow - outflow
-            count = totals["count"]
+        # Add all categories for this month, even if zero
+        for category in all_categories:
+            if category in monthly_data[month]:
+                totals = monthly_data[month][category]
+                inflow = totals["inflow"]
+                outflow = totals["outflow"]
+                net = inflow - outflow
+                count = totals["count"]
+            else:
+                inflow = 0.0
+                outflow = 0.0
+                net = 0.0
+                count = 0
             
             rows.append({
                 "month": month,
@@ -741,11 +752,13 @@ def generate_monthly_summary(monthly_data: Dict[str, Dict[str, Dict[str, Any]]])
     print("MONTHLY CASH FLOW ANALYSIS")
     print("="*80)
     
-    # Get all categories across all months
-    all_categories = set()
+    # Define all possible categories (including Income)
+    all_categories = ["Income", "Personalkostnader", "Programvare og datasystemer", "MVA", "ADK"]
+    
+    # Add any additional categories found in data
     for month_data in monthly_data.values():
-        all_categories.update(month_data.keys())
-    all_categories = sorted(all_categories)
+        all_categories.extend(month_data.keys())
+    all_categories = sorted(set(all_categories))
     
     # Print header
     print(f"{'Month':<12} ", end="")
