@@ -213,16 +213,22 @@ def extract_relevant_accounts_from_transaction(txn: Dict[str, Any]) -> List[str]
 def categorize_outflow(accounts: List[str], descriptions: List[str]) -> str:
     """
     Apply user's rules to derive a single category for an Outflow.
-    If multiple rules match, apply in priority: Personal -> Programvare -> ADK.
+    If multiple rules match, apply in priority: MVA -> Personal -> Programvare -> ADK.
     """
     # Normalize accounts (strip spaces)
     accs = set(a.strip() for a in accounts if a)
+    
+    # Check for MVA/VAT payments first
+    desc_text = " ".join(descriptions).lower()
+    if "merverdiavgift" in desc_text or "mva" in desc_text:
+        # Verify it's a VAT payment, not just VAT in purchase
+        if any(acc.startswith("274") or acc.startswith("270") for acc in accs):
+            return "MVA"
 
     # Personalkostnader
     if accs & PERSONAL_KOSTNADS_ACCOUNTS:
         return "Personalkostnader"
     # Heuristic: description hints for AGA/Employer's tax
-    desc_text = " ".join(descriptions).lower()
     if "aga" in desc_text or "arbeidsgiveravgift" in desc_text:
         return "Personalkostnader"
 
@@ -348,73 +354,109 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
     fieldnames = [
         "date",
         "description",
-        "transactionId", 
+        "transactionId",
+        "journalEntryId", 
         "net_amount_nok",
         "direction",
         "category",
         "expense_accounts",
-        "transaction_count",
         "has_reversals",
         "related_transaction_ids"
     ]
     
     out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
-    processed_transactions = set()
+    processed_journal_entries = set()
 
-    # Process each unique transaction
-    for transaction_id in transaction_map.keys():
-        if transaction_id in processed_transactions:
+    # Process each journal entry with bank lines individually
+    for je in filtered:
+        journal_entry_id = je.get("journalEntryId")
+        transaction_id = je.get("transactionId")
+        
+        # Find bank lines for this specific journal entry
+        bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
+        if not bank_lines:
             continue
             
-        net_amount, related_entries, has_reversals = calculate_net_amount(transaction_id, transaction_map)
-        
-        # Skip zero-net transactions (fully reversed)
-        if abs(net_amount) < 0.01:
-            continue
+        # Process each bank line separately (for cases like salary + tax withholding)
+        for i, bline in enumerate(bank_lines):
+            # Create unique key for this bank line
+            bank_line_key = f"{journal_entry_id}_{i}"
+            if bank_line_key in processed_journal_entries:
+                continue
+                
+            # Calculate net amount for this specific bank line
+            amount_ore = bline.get("amount", 0)
+            net_amount_ore = amount_ore
+            has_reversals = False
             
-        # Use the most recent entry for metadata
-        latest_entry = max(related_entries, key=lambda x: x.get("date", ""))
-        date = latest_entry.get("date", "")
-        description = latest_entry.get("description", "") or ""
+            # Check if this is a reversal
+            if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
+                has_reversals = True
         
-        # Fetch full transaction for categorization
-        txn = {}
-        expense_accounts: List[str] = []
-        descriptions: List[str] = [description]
-        try:
-            txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
-            expense_accounts = extract_relevant_accounts_from_transaction(txn)
-            descriptions.extend([
-                str(entry.get("description", "")) for entry in txn.get("entries", [])
-            ])
-        except Exception as e:
-            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+            # Check for offset transactions (reversals)
+            offset_id = je.get("offsetTransactionId")
+            if offset_id:
+                # Find the offset journal entry
+                for offset_je in filtered:
+                    if offset_je.get("journalEntryId") == offset_id:
+                        offset_bank_lines = [ln for ln in offset_je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
+                        # For now, add all offset bank lines (could be improved to match specific lines)
+                        for obline in offset_bank_lines:
+                            net_amount_ore += obline.get("amount", 0)
+                        has_reversals = True
+                        break
+        
+            net_amount_nok = net_amount_ore / 100.0
+        
+            # Skip zero-net transactions (fully reversed)
+            if abs(net_amount_nok) < 0.01:
+                continue
+                
+            # Get metadata from this journal entry
+            date = je.get("date", "")
+            description = je.get("description", "") or ""
+            
+            # Fetch full transaction for categorization
+            txn = {}
+            expense_accounts: List[str] = []
+            descriptions: List[str] = [description]
+            try:
+                if transaction_id is not None:
+                    txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                    expense_accounts = extract_relevant_accounts_from_transaction(txn)
+                    descriptions.extend([
+                        str(entry.get("description", "")) for entry in txn.get("entries", [])
+                    ])
+            except Exception as e:
+                print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
 
-        # Determine direction and category
-        direction = "Inflow" if net_amount > 0 else "Outflow"
-        if direction == "Inflow":
-            category = "Income"
-        else:
-            category = categorize_outflow(expense_accounts, descriptions)
+            # Determine direction and category
+            direction = "Inflow" if net_amount_nok > 0 else "Outflow"
+            if direction == "Inflow":
+                category = "Income"
+            else:
+                category = categorize_outflow(expense_accounts, descriptions)
 
-        # Collect related transaction IDs
-        related_ids = sorted(set(entry.get("transactionId") for entry in related_entries if entry.get("transactionId")))
+            # Collect related transaction IDs
+            related_ids = [transaction_id] if transaction_id else []
+            if offset_id:
+                related_ids.append(offset_id)
         
-        rows.append({
-            "date": date,
-            "description": description,
-            "transactionId": transaction_id,
-            "net_amount_nok": f"{abs(net_amount):.2f}",
-            "direction": direction,
-            "category": category,
-            "expense_accounts": ",".join(sorted(set(expense_accounts))),
-            "transaction_count": len(related_entries),
-            "has_reversals": "Yes" if has_reversals else "No",
-            "related_transaction_ids": ",".join(map(str, related_ids))
-        })
+            rows.append({
+                "date": date,
+                "description": description,
+                "transactionId": transaction_id,
+                "journalEntryId": journal_entry_id,
+                "net_amount_nok": f"{abs(net_amount_nok):.2f}",
+                "direction": direction,
+                "category": category,
+                "expense_accounts": ",".join(sorted(set(expense_accounts))),
+                "has_reversals": "Yes" if has_reversals else "No",
+                "related_transaction_ids": ",".join(map(str, related_ids))
+            })
         
-        processed_transactions.add(transaction_id)
+            processed_journal_entries.add(bank_line_key)
 
     # Write net CSV
     with open(out_path, "w", newline="", encoding="utf-8") as f:
