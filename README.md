@@ -1,46 +1,72 @@
-# Fiken Transaction Analyzer
+# Fiken Cash Flow Analyzer
 
-A Python script that analyzes Fiken journal entries for October 1-10, 2025, filtering transactions that touch bank account 1920:10001, and categorizing them based on expense accounts with proportional allocation.
+Analyzes Fiken journal entries for bank account 1920:10001, categorizes transactions by type, and generates comprehensive cash flow reports with balance validation.
 
-## Setup
+## Features
 
-1. Copy `.env.template` to `.env` and fill in your Fiken API credentials:
-   ```
-   FIKEN_COMPANY_SLUG=your-company-slug-here
-   FIKEN_TOKEN=your-fiken-api-token-here
-   ```
+- **Transaction Analysis**: Fetches journal entries for date range and filters bank account transactions
+- **Smart Categorization**: Uses Fiken transaction types with fallback to account-based rules
+- **Balance Validation**: Validates opening/closing balances against calculated cash flow
+- **Monthly Reports**: Generates monthly breakdown by category
+- **Cancellation Handling**: Automatically filters out cancelled transactions (type: "Annullering")
 
-2. Install dependencies:
+## Quick Start
+
+1. **Setup Environment**:
    ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows: venv\Scripts\activate
    pip install -r requirements.txt
    ```
 
-## Usage
+2. **Configure**:
+   - Copy `.env.template` to `.env`
+   - Add your Fiken token and company slug
 
-Run the analyzer:
-```bash
-python analyze_transactions.py
+3. **Run Analysis**:
+   ```bash
+   python analyze_transactions.py
+   ```
+
+## Output Files
+
+- `fiken_net_transactions_YYYY-MM-DD_to_YYYY-MM-DD.csv` - Detailed transaction report
+- `fiken_monthly_analysis_YYYY-MM-DD_to_YYYY-MM-DD.csv` - Monthly category breakdown
+
+## Categories
+
+- **Income**: Sales transactions (type: "Salg")
+- **Personalkostnader**: Salary, payroll taxes (accounts: 5001, 5092, 5401, 5405, 5901, 5950, 2771, 6795)
+- **Programvare og datasystemer**: Software/IT (accounts: 6420, 6553)
+- **MVA**: VAT payments (type: "Mva-oppgjør" or merverdiavgift in description)
+- **ADK**: Other/Administrative (default)
+
+## Configuration
+
+Edit `analyze_transactions.py` to change:
+- Date range: `DATE_FROM` and `DATE_TO`
+- Bank account: `BANK_ACCOUNT_CODE`
+- Category rules: Account sets and type mappings
+
+## Balance Validation
+
+The analyzer validates that:
+```
+Opening Balance + Net Cash Flow = Closing Balance
 ```
 
-This will:
-1. Fetch all journal entries from October 1-10, 2025
-2. Filter for entries touching bank account 1920:10001
-3. Fetch full transaction details for each entry
-4. Categorize transactions based on expense accounts
-5. Export results to `fiken_transactions_2025-10-01_to_2025-10-10.csv`
+If validation fails, check for:
+- Bank transfers not in journal entries
+- Interest payments
+- Transactions outside date range
+- API data inconsistencies
 
-## Categorization Rules
+## Requirements
 
-- **Inflow** (positive bank amount) → `Income`
-- **Outflow** (negative bank amount) → Categorized by expense accounts:
-  - `5001, 5092, 5401, 5405, 5901, 5950, 2771, 2400:20024` → `Personalkostnader`
-  - `6420, 6553` → `Programvare og datasystemer`
-  - All others → `ADK`
+- Python 3.7+
+- requests
+- python-dotenv
 
-## Output Format
+## License
 
-The CSV contains one row per expense line with proportional bank amount allocation:
-- Date, Description, Transaction ID, Journal Entry ID
-- Bank Amount (NOK) - proportional amount allocated to this expense line
-- Direction (Inflow/Outflow), Category, Expense Account
-- Expense Account Amount (NOK) - original expense line amount
+Private use only.
