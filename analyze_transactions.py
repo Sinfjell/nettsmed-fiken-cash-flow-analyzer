@@ -25,7 +25,7 @@ FIKEN_COMPANY_SLUG = "nettsmed-as"
 
 # Date window (inclusive)
 DATE_FROM = "2025-10-01"
-DATE_TO = "2025-10-10"
+DATE_TO = "2025-10-31"
 
 # Bank account to inspect
 BANK_ACCOUNT_CODE = "1920:10001"
@@ -350,9 +350,9 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
             continue
         
-        # Skip cancelled transactions (but not Motlinje reversals which are income)
-        if transaction_type == "Annullering" and "motlinje" not in je.get("description", "").lower():
-            print(f"Skipping cancelled transaction {transaction_id}")
+        # Skip cancelled transactions (including Motlinje reversals with type Annullering)
+        if transaction_type == "Annullering":
+            print(f"Skipping cancelled transaction {transaction_id} (type: {transaction_type})")
             continue
         
         # Process each bank line
@@ -596,9 +596,9 @@ def generate_monthly_analysis_by_type(session: requests.Session, filtered: List[
             print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
             continue
         
-        # Skip cancelled transactions (but not Motlinje reversals which are income)
-        if transaction_type == "Annullering" and "motlinje" not in je.get("description", "").lower():
-            print(f"Skipping cancelled transaction {transaction_id}")
+        # Skip cancelled transactions (including Motlinje reversals with type Annullering)
+        if transaction_type == "Annullering":
+            print(f"Skipping cancelled transaction {transaction_id} (type: {transaction_type})")
             continue
         
         # Process each bank line
