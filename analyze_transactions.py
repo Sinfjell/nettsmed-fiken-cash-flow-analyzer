@@ -24,8 +24,8 @@ FIKEN_TOKEN = "5294010348.kuBGOemzaPEMSLqdtViPJed9njsO07vr"
 FIKEN_COMPANY_SLUG = "nettsmed-as"
 
 # Date window (inclusive)
-DATE_FROM = "2025-10-01"
-DATE_TO = "2025-10-31"
+DATE_FROM = "2025-01-01"
+DATE_TO = "2025-12-31"
 
 # Bank account to inspect
 BANK_ACCOUNT_CODE = "1920:10001"
@@ -111,6 +111,14 @@ def fetch_transaction(session: requests.Session, company_slug: str, transaction_
     resp = _get(session, url)
     return resp.json()
 
+def fetch_account_balance(session: requests.Session, company_slug: str, account_code: str, date: str) -> float:
+    """Fetch account balance for a specific date."""
+    url = f"{BASE_URL}/companies/{company_slug}/accountBalances/{account_code}"
+    params = {"date": date}
+    resp = _get(session, url, params=params)
+    data = resp.json()
+    return float(data.get("balance", 0)) / 100.0  # Convert from øre to NOK
+
 # -------------------------
 # Data processing
 # -------------------------
@@ -186,7 +194,6 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
     out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
     processed_transactions = set()
-    processed_invoices = set()
 
     print("Processing transactions by type...")
     
@@ -207,6 +214,12 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             if transaction_id is not None:
                 txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
                 transaction_type = txn.get("type", "")
+                if not transaction_type:
+                    print(f"Warning: no type field for transaction {transaction_id}, skipping")
+                    continue
+            else:
+                print(f"Warning: no transaction ID for journal entry {journal_entry_id}")
+                continue
         except Exception as e:
             print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
             continue
@@ -248,15 +261,6 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             # Check for reversals
             has_reversals = "motlinje" in je.get("description", "").lower()
             
-            # Check for invoice deduplication
-            invoice_num = extract_invoice_number(je.get("description", ""))
-            if invoice_num and invoice_num in processed_invoices:
-                print(f"Skipping duplicate invoice {invoice_num}")
-                continue
-            
-            if invoice_num:
-                processed_invoices.add(invoice_num)
-            
             rows.append({
                 "date": je.get("date", ""),
                 "description": je.get("description", ""),
@@ -280,7 +284,8 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
         writer.writerows(rows)
 
     print(f"Net report: Wrote {len(rows)} rows to {out_path}")
-    generate_summary_stats(rows)
+    total_inflow, total_outflow = generate_summary_stats(rows)
+    return total_inflow, total_outflow
 
 def generate_monthly_analysis_by_type(session: requests.Session, filtered: List[Dict[str, Any]]):
     """Generate monthly analysis using transaction types."""
@@ -306,6 +311,12 @@ def generate_monthly_analysis_by_type(session: requests.Session, filtered: List[
             if transaction_id is not None:
                 txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
                 transaction_type = txn.get("type", "")
+                if not transaction_type:
+                    print(f"Warning: no type field for transaction {transaction_id}, skipping")
+                    continue
+            else:
+                print(f"Warning: no transaction ID for journal entry {journal_entry_id}")
+                continue
         except Exception as e:
             print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
             continue
@@ -507,6 +518,46 @@ def generate_summary_stats(rows: List[Dict[str, Any]]):
     print("-"*60)
     print(f"{'TOTAL':<25} {total_inflow:>11.2f} {total_outflow:>11.2f} {total_inflow-total_outflow:>11.2f}")
     print("="*60)
+    
+    return total_inflow, total_outflow
+
+def validate_account_balance(session: requests.Session, total_inflow: float, total_outflow: float):
+    """Validate that opening balance + net cash flow = closing balance."""
+    print("\n" + "="*60)
+    print("ACCOUNT BALANCE VALIDATION")
+    print("="*60)
+    
+    try:
+        # Fetch opening balance (2025-01-01)
+        opening_balance = fetch_account_balance(session, FIKEN_COMPANY_SLUG, BANK_ACCOUNT_CODE, "2025-01-01")
+        print(f"Opening balance (2025-01-01): {opening_balance:>15.2f} NOK")
+        
+        # Fetch closing balance (2025-12-31)
+        closing_balance = fetch_account_balance(session, FIKEN_COMPANY_SLUG, BANK_ACCOUNT_CODE, "2025-12-31")
+        print(f"Closing balance (2025-12-31): {closing_balance:>15.2f} NOK")
+        
+        # Calculate net cash flow from transactions
+        net_cash_flow = total_inflow - total_outflow
+        print(f"Net cash flow (transactions): {net_cash_flow:>15.2f} NOK")
+        
+        # Calculate expected closing balance
+        expected_closing = opening_balance + net_cash_flow
+        print(f"Expected closing balance: {expected_closing:>15.2f} NOK")
+        
+        # Calculate difference
+        difference = closing_balance - expected_closing
+        print(f"Difference: {difference:>15.2f} NOK")
+        
+        if abs(difference) < 0.01:
+            print("✅ VALIDATION PASSED: Balances match!")
+        else:
+            print("❌ VALIDATION FAILED: Balances do not match!")
+            print(f"   Difference: {difference:.2f} NOK")
+        
+    except Exception as e:
+        print(f"❌ VALIDATION ERROR: Failed to fetch account balances: {e}")
+    
+    print("="*60)
 
 # -------------------------
 # Main routine
@@ -529,8 +580,11 @@ def main():
         print(f"Kept {len(filtered)} entries hitting account {BANK_ACCOUNT_CODE}.")
         
         # Generate reports
-        generate_net_report(session, filtered)
+        total_inflow, total_outflow = generate_net_report(session, filtered)
         generate_monthly_analysis_by_type(session, filtered)
+        
+        # Validate account balance
+        validate_account_balance(session, total_inflow, total_outflow)
 
 if __name__ == "__main__":
     try:
