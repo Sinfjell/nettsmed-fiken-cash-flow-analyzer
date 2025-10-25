@@ -238,6 +238,9 @@ def main():
     # Generate both full and net transaction reports
     generate_full_report(session, filtered)
     generate_net_report(session, filtered)
+    
+    # Generate monthly analysis report
+    generate_monthly_analysis(session, filtered)
 
 def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any]]):
     """Generate full transaction report with offset information."""
@@ -545,6 +548,246 @@ def generate_summary_stats(rows: List[Dict[str, Any]]):
     print("-"*60)
     print(f"{'TOTAL':<25} {total_inflow:>11.2f} {total_outflow:>11.2f} {total_inflow-total_outflow:>11.2f}")
     print("="*60)
+
+def generate_monthly_analysis(session: requests.Session, filtered: List[Dict[str, Any]]):
+    """Generate monthly analysis report showing costs by category and month."""
+    print("\nGenerating monthly analysis...")
+    
+    # Group entries by invoice number for net calculation
+    invoice_groups, non_invoice_entries = group_by_invoice(filtered)
+    
+    # Process all transactions (invoice groups + non-invoice entries)
+    monthly_data = {}
+    
+    # Process invoice groups
+    for invoice_num, invoice_entries in invoice_groups.items():
+        net_amount, latest_entry, has_reversals = calculate_invoice_net_amount(invoice_entries)
+        
+        # Skip zero-net transactions (fully reversed)
+        if abs(net_amount) < 0.01:
+            continue
+            
+        # Get month from latest entry
+        date_str = latest_entry.get("date", "")
+        if date_str:
+            month_key = date_str[:7]  # YYYY-MM format
+            
+            # Get categorization
+            transaction_id = latest_entry.get("transactionId")
+            txn = {}
+            expense_accounts: List[str] = []
+            descriptions: List[str] = [latest_entry.get("description", "")]
+            
+            try:
+                if transaction_id is not None:
+                    txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                    expense_accounts = extract_relevant_accounts_from_transaction(txn)
+                    descriptions.extend([
+                        str(entry.get("description", "")) for entry in txn.get("entries", [])
+                    ])
+            except Exception as e:
+                print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+
+            # Determine direction and category
+            direction = "Inflow" if net_amount > 0 else "Outflow"
+            if direction == "Inflow":
+                category = "Income"
+            else:
+                category = categorize_outflow(expense_accounts, descriptions)
+            
+            # Add to monthly data
+            if month_key not in monthly_data:
+                monthly_data[month_key] = {}
+            if category not in monthly_data[month_key]:
+                monthly_data[month_key][category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
+            
+            if direction == "Inflow":
+                monthly_data[month_key][category]["inflow"] += abs(net_amount)
+            else:
+                monthly_data[month_key][category]["outflow"] += abs(net_amount)
+            monthly_data[month_key][category]["count"] += 1
+    
+    # Process non-invoice entries
+    processed_journal_entries = set()
+    
+    for je in non_invoice_entries:
+        journal_entry_id = je.get("journalEntryId")
+        transaction_id = je.get("transactionId")
+        
+        # Find bank lines for this specific journal entry
+        bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
+        if not bank_lines:
+            continue
+            
+        # Process each bank line separately
+        for i, bline in enumerate(bank_lines):
+            bank_line_key = f"{journal_entry_id}_{i}"
+            if bank_line_key in processed_journal_entries:
+                continue
+                
+            # Calculate net amount for this specific bank line
+            amount_ore = bline.get("amount", 0)
+            net_amount_ore = amount_ore
+            has_reversals = False
+            
+            # Check if this is a reversal
+            if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
+                has_reversals = True
+        
+            # Check for offset transactions (reversals)
+            offset_id = je.get("offsetTransactionId")
+            if offset_id:
+                for offset_je in filtered:
+                    if offset_je.get("journalEntryId") == offset_id:
+                        offset_bank_lines = [ln for ln in offset_je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
+                        for obline in offset_bank_lines:
+                            net_amount_ore += obline.get("amount", 0)
+                        has_reversals = True
+                        break
+        
+            net_amount_nok = net_amount_ore / 100.0
+        
+            # Skip zero-net transactions (fully reversed)
+            if abs(net_amount_nok) < 0.01:
+                continue
+                
+            # Get month from journal entry
+            date_str = je.get("date", "")
+            if date_str:
+                month_key = date_str[:7]  # YYYY-MM format
+                
+                # Get categorization
+                txn = {}
+                expense_accounts: List[str] = []
+                descriptions: List[str] = [je.get("description", "")]
+                
+                try:
+                    if transaction_id is not None:
+                        txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                        expense_accounts = extract_relevant_accounts_from_transaction(txn)
+                        descriptions.extend([
+                            str(entry.get("description", "")) for entry in txn.get("entries", [])
+                        ])
+                except Exception as e:
+                    print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+
+                # Determine direction and category
+                direction = "Inflow" if net_amount_nok > 0 else "Outflow"
+                if direction == "Inflow":
+                    category = "Income"
+                else:
+                    category = categorize_outflow(expense_accounts, descriptions)
+                
+                # Add to monthly data
+                if month_key not in monthly_data:
+                    monthly_data[month_key] = {}
+                if category not in monthly_data[month_key]:
+                    monthly_data[month_key][category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
+                
+                if direction == "Inflow":
+                    monthly_data[month_key][category]["inflow"] += abs(net_amount_nok)
+                else:
+                    monthly_data[month_key][category]["outflow"] += abs(net_amount_nok)
+                monthly_data[month_key][category]["count"] += 1
+            
+            processed_journal_entries.add(bank_line_key)
+    
+    # Generate monthly CSV report
+    generate_monthly_csv(monthly_data)
+    
+    # Generate monthly summary
+    generate_monthly_summary(monthly_data)
+
+def generate_monthly_csv(monthly_data: Dict[str, Dict[str, Dict[str, Any]]]):
+    """Generate CSV file with monthly breakdown by category."""
+    fieldnames = [
+        "month",
+        "category",
+        "inflow_nok",
+        "outflow_nok",
+        "net_nok",
+        "transaction_count"
+    ]
+    
+    out_path = f"fiken_monthly_analysis_{DATE_FROM}_to_{DATE_TO}.csv"
+    rows = []
+    
+    for month in sorted(monthly_data.keys()):
+        for category, totals in sorted(monthly_data[month].items()):
+            inflow = totals["inflow"]
+            outflow = totals["outflow"]
+            net = inflow - outflow
+            count = totals["count"]
+            
+            rows.append({
+                "month": month,
+                "category": category,
+                "inflow_nok": f"{inflow:.2f}",
+                "outflow_nok": f"{outflow:.2f}",
+                "net_nok": f"{net:.2f}",
+                "transaction_count": count
+            })
+    
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    
+    print(f"Monthly analysis: Wrote {len(rows)} rows to {out_path}")
+
+def generate_monthly_summary(monthly_data: Dict[str, Dict[str, Dict[str, Any]]]):
+    """Generate monthly summary statistics."""
+    print("\n" + "="*80)
+    print("MONTHLY CASH FLOW ANALYSIS")
+    print("="*80)
+    
+    # Get all categories across all months
+    all_categories = set()
+    for month_data in monthly_data.values():
+        all_categories.update(month_data.keys())
+    all_categories = sorted(all_categories)
+    
+    # Print header
+    print(f"{'Month':<12} ", end="")
+    for category in all_categories:
+        print(f"{category:<20} ", end="")
+    print("TOTAL")
+    print("-" * (12 + 21 * len(all_categories) + 10))
+    
+    # Print monthly data
+    for month in sorted(monthly_data.keys()):
+        print(f"{month:<12} ", end="")
+        month_total = 0
+        
+        for category in all_categories:
+            if category in monthly_data[month]:
+                outflow = monthly_data[month][category]["outflow"]
+                inflow = monthly_data[month][category]["inflow"]
+                net = inflow - outflow
+                month_total += net
+                print(f"{net:>19.2f} ", end="")
+            else:
+                print(f"{'0.00':>19} ", end="")
+        
+        print(f"{month_total:>9.2f}")
+    
+    # Print totals row
+    print("-" * (12 + 21 * len(all_categories) + 10))
+    print(f"{'TOTAL':<12} ", end="")
+    grand_total = 0
+    
+    for category in all_categories:
+        category_total = 0
+        for month_data in monthly_data.values():
+            if category in month_data:
+                inflow = month_data[category]["inflow"]
+                outflow = month_data[category]["outflow"]
+                category_total += inflow - outflow
+        grand_total += category_total
+        print(f"{category_total:>19.2f} ", end="")
+    
+    print(f"{grand_total:>9.2f}")
+    print("="*80)
 
 if __name__ == "__main__":
     try:
