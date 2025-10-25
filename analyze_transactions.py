@@ -32,7 +32,7 @@ BANK_ACCOUNT_CODE = "1920:10001"
 
 
 # Category rules
-PERSONAL_KOSTNADS_ACCOUNTS = set(["5001","5092","5401","5405","5901","5950","2771","2400:20024"])  # includes AP subaccount Fjellestad AS
+PERSONAL_KOSTNADS_ACCOUNTS = set(["5001","5092","5401","5405","5901","5950","2771"])  # removed 2400:20024 as it's a general AP account
 PROGRAMVARE_ACCOUNTS = set(["6420","6553"])
 VAT_ACCOUNTS = set(["2700","2710","2711","2720","2740"])  # common VAT accounts, not categorized as expenses
 
@@ -308,16 +308,14 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
     fieldnames = [
         "date",
         "description",
-        "invoice_number",
         "transactionId",
-        "journalEntryId", 
+        "journalEntryId",
+        "transaction_type",
         "net_amount_nok",
         "direction",
         "category",
         "expense_accounts",
-        "transaction_count",
-        "has_reversals",
-        "related_transaction_ids"
+        "has_reversals"
     ]
     
     out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
@@ -391,16 +389,14 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             rows.append({
                 "date": je.get("date", ""),
                 "description": je.get("description", ""),
-                "invoice_number": "",  # No longer using invoice grouping
                 "transactionId": transaction_id,
                 "journalEntryId": journal_entry_id,
+                "transaction_type": transaction_type,
                 "net_amount_nok": f"{abs(net_amount_nok):.2f}",
                 "direction": direction,
                 "category": category,
                 "expense_accounts": ",".join(sorted(set(expense_accounts))),
-                "transaction_count": 1,
-                "has_reversals": "Yes" if has_reversals else "No",
-                "related_transaction_ids": str(transaction_id) if transaction_id else ""
+                "has_reversals": "Yes" if has_reversals else "No"
             })
         
         # Mark transaction as processed
