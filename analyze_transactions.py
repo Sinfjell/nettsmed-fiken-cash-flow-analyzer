@@ -76,6 +76,7 @@ def fetch_journal_entries(session: requests.Session, company_slug: str, date_fro
     """
     Fetch all journal entries for a date window [date_from, date_to], inclusive.
     Paginates using Fiken-Api-Page* headers.
+    Includes offsetTransactionId for reversal detection.
     """
     all_entries: List[Dict[str, Any]] = []
     page = 0
@@ -109,6 +110,79 @@ def fetch_transaction(session: requests.Session, company_slug: str, transaction_
     url = f"{BASE_URL}/companies/{company_slug}/transactions/{transaction_id}"
     resp = _get(session, url)
     return resp.json()
+
+# -------------------------
+# Net effect calculation
+# -------------------------
+def build_transaction_graph(entries: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Build a graph of transactions and their offsets using offsetTransactionId.
+    Returns a mapping of transaction_id -> list of related journal entries.
+    """
+    transaction_map: Dict[int, List[Dict[str, Any]]] = {}
+    
+    for entry in entries:
+        transaction_id = entry.get("transactionId")
+        offset_id = entry.get("offsetTransactionId")
+        
+        if transaction_id is not None:
+            if transaction_id not in transaction_map:
+                transaction_map[transaction_id] = []
+            transaction_map[transaction_id].append(entry)
+        
+        # Also add to offset transaction if it exists
+        if offset_id is not None:
+            if offset_id not in transaction_map:
+                transaction_map[offset_id] = []
+            transaction_map[offset_id].append(entry)
+    
+    return transaction_map
+
+def calculate_net_amount(transaction_id: int, transaction_map: Dict[int, List[Dict[str, Any]]]) -> Tuple[float, List[Dict[str, Any]], bool]:
+    """
+    Calculate net amount for a transaction by considering all related entries.
+    Returns: (net_amount_nok, all_related_entries, has_reversals)
+    """
+    if transaction_id not in transaction_map:
+        return 0.0, [], False
+    
+    related_entries = transaction_map[transaction_id]
+    net_amount_ore = 0
+    has_reversals = False
+    
+    for entry in related_entries:
+        # Find bank line for this entry
+        for line in entry.get("lines", []):
+            if str(line.get("account")) == BANK_ACCOUNT_CODE:
+                amount_ore = line.get("amount", 0)
+                net_amount_ore += amount_ore
+                
+                # Check if this is a reversal (negative amount or "Motlinje" description)
+                if amount_ore < 0 or "motlinje" in entry.get("description", "").lower():
+                    has_reversals = True
+                break
+    
+    net_amount_nok = net_amount_ore / 100.0
+    return net_amount_nok, related_entries, has_reversals
+
+def extract_invoice_number(description: str) -> str:
+    """Extract invoice number from description (e.g., 'faktura #20251004777775')."""
+    import re
+    match = re.search(r'faktura\s*#?(\d+)', description, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+def group_by_invoice(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """Group entries by invoice number as fallback for offsetTransactionId."""
+    invoice_groups: Dict[str, List[Dict[str, Any]]] = {}
+    
+    for entry in entries:
+        invoice_num = extract_invoice_number(entry.get("description", ""))
+        if invoice_num:
+            if invoice_num not in invoice_groups:
+                invoice_groups[invoice_num] = []
+            invoice_groups[invoice_num].append(entry)
+    
+    return invoice_groups
 
 # -------------------------
 # Categorization logic
@@ -179,49 +253,65 @@ def main():
                 break
     print(f"Kept {len(filtered)} entries hitting account {BANK_ACCOUNT_CODE}.")
 
-    # Prepare CSV
+    # Build transaction graph for net effect calculation
+    print("Building transaction relationship graph...")
+    transaction_map = build_transaction_graph(filtered)
+    print(f"Found {len(transaction_map)} unique transactions.")
+
+    # Generate both full and net transaction reports
+    generate_full_report(session, filtered, transaction_map)
+    generate_net_report(session, filtered, transaction_map)
+
+def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any]], transaction_map: Dict[int, List[Dict[str, Any]]]):
+    """Generate full transaction report with offset information."""
     fieldnames = [
         "date",
-        "description",
+        "description", 
         "transactionId",
         "journalEntryId",
+        "offsetTransactionId",
         "amount_nok_on_1920_10001",
         "direction",
         "category",
-        "expense_accounts"
+        "expense_accounts",
+        "has_reversals"
     ]
-    out_path = OUTPUT_CSV
+    
+    out_path = f"fiken_full_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
 
     for idx, je in enumerate(filtered, 1):
         journal_entry_id = je.get("journalEntryId")
         transaction_id = je.get("transactionId")
+        offset_id = je.get("offsetTransactionId")
         date = je.get("date", "")
         description = je.get("description", "") or ""
 
-        # Find the bank line (there can be multiple; consider each separately)
+        # Find the bank line
         bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
         if not bank_lines:
-            # Shouldn't happen due to filter, but guard anyway
             continue
 
-        # Fetch full transaction
+        # Fetch full transaction for categorization
         txn = {}
         expense_accounts: List[str] = []
         descriptions: List[str] = [description]
         if transaction_id is not None:
             try:
                 txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
-                # Gather expense/counter accounts across the whole transaction
                 expense_accounts = extract_relevant_accounts_from_transaction(txn)
-                # collect descriptions to scan for "AGA"
                 descriptions.extend([
                     str(entry.get("description", "")) for entry in txn.get("entries", [])
                 ])
             except Exception as e:
                 print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
 
-        # Determine category and emit one row per bank line
+        # Check if this transaction has reversals
+        has_reversals = False
+        if transaction_id is not None:
+            _, _, has_reversals = calculate_net_amount(transaction_id, transaction_map)
+
+        # Emit one row per bank line
         for bline in bank_lines:
             direction, amount_nok = determine_direction_and_amount(bline)
             if direction == "Inflow":
@@ -234,23 +324,151 @@ def main():
                 "description": description,
                 "transactionId": transaction_id,
                 "journalEntryId": journal_entry_id,
+                "offsetTransactionId": offset_id or "",
                 "amount_nok_on_1920_10001": f"{amount_nok:.2f}",
                 "direction": direction,
                 "category": category,
-                "expense_accounts": ",".join(sorted(set(expense_accounts)))
+                "expense_accounts": ",".join(sorted(set(expense_accounts))),
+                "has_reversals": "Yes" if has_reversals else "No"
             })
 
-        # Progress indicator
         if idx % 25 == 0 or idx == len(filtered):
-            print(f"Processed {idx}/{len(filtered)} entries...")
+            print(f"Processed {idx}/{len(filtered)} entries for full report...")
 
-    # Write CSV
+    # Write full CSV
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Done. Wrote {len(rows)} rows to {out_path}")
+    print(f"Full report: Wrote {len(rows)} rows to {out_path}")
+
+def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]], transaction_map: Dict[int, List[Dict[str, Any]]]):
+    """Generate net transaction report showing only net effects."""
+    fieldnames = [
+        "date",
+        "description",
+        "transactionId", 
+        "net_amount_nok",
+        "direction",
+        "category",
+        "expense_accounts",
+        "transaction_count",
+        "has_reversals",
+        "related_transaction_ids"
+    ]
+    
+    out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
+    rows = []
+    processed_transactions = set()
+
+    # Process each unique transaction
+    for transaction_id in transaction_map.keys():
+        if transaction_id in processed_transactions:
+            continue
+            
+        net_amount, related_entries, has_reversals = calculate_net_amount(transaction_id, transaction_map)
+        
+        # Skip zero-net transactions (fully reversed)
+        if abs(net_amount) < 0.01:
+            continue
+            
+        # Use the most recent entry for metadata
+        latest_entry = max(related_entries, key=lambda x: x.get("date", ""))
+        date = latest_entry.get("date", "")
+        description = latest_entry.get("description", "") or ""
+        
+        # Fetch full transaction for categorization
+        txn = {}
+        expense_accounts: List[str] = []
+        descriptions: List[str] = [description]
+        try:
+            txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+            expense_accounts = extract_relevant_accounts_from_transaction(txn)
+            descriptions.extend([
+                str(entry.get("description", "")) for entry in txn.get("entries", [])
+            ])
+        except Exception as e:
+            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+
+        # Determine direction and category
+        direction = "Inflow" if net_amount > 0 else "Outflow"
+        if direction == "Inflow":
+            category = "Income"
+        else:
+            category = categorize_outflow(expense_accounts, descriptions)
+
+        # Collect related transaction IDs
+        related_ids = sorted(set(entry.get("transactionId") for entry in related_entries if entry.get("transactionId")))
+        
+        rows.append({
+            "date": date,
+            "description": description,
+            "transactionId": transaction_id,
+            "net_amount_nok": f"{abs(net_amount):.2f}",
+            "direction": direction,
+            "category": category,
+            "expense_accounts": ",".join(sorted(set(expense_accounts))),
+            "transaction_count": len(related_entries),
+            "has_reversals": "Yes" if has_reversals else "No",
+            "related_transaction_ids": ",".join(map(str, related_ids))
+        })
+        
+        processed_transactions.add(transaction_id)
+
+    # Write net CSV
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Net report: Wrote {len(rows)} rows to {out_path}")
+    
+    # Generate summary statistics
+    generate_summary_stats(rows)
+
+def generate_summary_stats(rows: List[Dict[str, Any]]):
+    """Generate summary statistics by category."""
+    category_totals = {}
+    
+    for row in rows:
+        category = row["category"]
+        amount = float(row["net_amount_nok"])
+        direction = row["direction"]
+        
+        if category not in category_totals:
+            category_totals[category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
+        
+        if direction == "Inflow":
+            category_totals[category]["inflow"] += amount
+        else:
+            category_totals[category]["outflow"] += amount
+        
+        category_totals[category]["count"] += 1
+    
+    print("\n" + "="*60)
+    print("CASH FLOW SUMMARY (Net Effects)")
+    print("="*60)
+    print(f"{'Category':<25} {'Inflow':<12} {'Outflow':<12} {'Net':<12} {'Count':<8}")
+    print("-"*60)
+    
+    total_inflow = 0
+    total_outflow = 0
+    
+    for category, totals in sorted(category_totals.items()):
+        inflow = totals["inflow"]
+        outflow = totals["outflow"]
+        net = inflow - outflow
+        count = totals["count"]
+        
+        total_inflow += inflow
+        total_outflow += outflow
+        
+        print(f"{category:<25} {inflow:>11.2f} {outflow:>11.2f} {net:>11.2f} {count:>7}")
+    
+    print("-"*60)
+    print(f"{'TOTAL':<25} {total_inflow:>11.2f} {total_outflow:>11.2f} {total_inflow-total_outflow:>11.2f}")
+    print("="*60)
 
 if __name__ == "__main__":
     try:

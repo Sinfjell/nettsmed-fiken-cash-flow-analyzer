@@ -1,0 +1,11 @@
+date,description,transactionId,net_amount_nok,direction,category,expense_accounts,transaction_count,has_reversals,related_transaction_ids
+2025-10-06,"Månedsabonnement Fiken, API, Bankintegrasjon, OCR - fakturering med KID, Lønn (inkl 1 ansatt) mm.",9616706181,4008.75,Outflow,Programvare og datasystemer,"1920:10001,2400:20001,2711,6553",1,Yes,9616706181
+2025-10-01,Se Detaljer i Fakturaoversikt Nettb September 2025 for foretak 00934297571,10626750775,361.00,Outflow,ADK,"1920:10001,7770",1,Yes,10626750775
+2025-10-02,Betaling  (faktura #5372098204),10627537942,388.55,Outflow,Programvare og datasystemer,"1920:10001,2400:20005,2702,2712,6553,8160",1,Yes,10627537942
+2025-10-02,Betaling  (faktura #83278844),10627537955,40.70,Outflow,Programvare og datasystemer,"1920:10001,2400:20010,2702,2712,6553,8160",1,Yes,10627537955
+2025-10-06,Overføring av lønn og forskuddstrekk oktober 2025,10627774104,21900.00,Outflow,Personalkostnader,"1920:10001,1950:10001,2600,2771,2785,2930:10001,2941,5001,5092,5401,5405,7740",1,Yes,10627774104
+2025-10-06,Betaling av merverdiavgift (mva-melding jul-aug 2025),10627774124,10832.00,Outflow,ADK,"1920:10001,2701,2702,2711,2712,2740,7740",1,Yes,10627774124
+2025-10-06,Betaling  (faktura #JAQTYPH9-0002),10714529302,296.68,Outflow,Personalkostnader,"1920:10001,2400:20024,2702,2712,6553,8160",1,Yes,10714529302
+2025-10-08,"Kjøp, kontant: Epost-emne: Fwd: Bekreftelse: Vi har mottatt betalingen for Fotoplan (20 GB)",10714529315,130.00,Outflow,Programvare og datasystemer,"1920:10001,2711,6553",1,Yes,10714529315
+2025-10-06,Betaling  (faktura #75535388),10714529660,2429.71,Outflow,Programvare og datasystemer,"1920:10001,2400:20037,2702,2712,6553,8160",1,Yes,10714529660
+2025-10-06,Betaling  (faktura #20251004777775),10747859061,34783.25,Outflow,Programvare og datasystemer,"1920:10001,2400:20011,2702,2712,6553,8160",1,Yes,10747859061
