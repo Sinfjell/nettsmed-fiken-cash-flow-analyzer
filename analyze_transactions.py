@@ -36,6 +36,18 @@ PERSONAL_KOSTNADS_ACCOUNTS = set(["5001","5092","5401","5405","5901","5950","277
 PROGRAMVARE_ACCOUNTS = set(["6420","6553"])
 VAT_ACCOUNTS = set(["2700","2710","2711","2720","2740"])  # common VAT accounts, not categorized as expenses
 
+# Transaction type to category mapping
+TYPE_TO_CATEGORY = {
+    "Salg": "Income",
+    "Lønn": "Personalkostnader", 
+    "Betaling av arbeidsgiveravgift": "Personalkostnader",
+    "Mva-oppgjør": "MVA",
+    "Bankomkostning": "ADK",
+    "Kjøp": None,  # Determine from accounts
+    "Fri": None,   # Determine from accounts
+    "Inngående balanse": "ADK",
+}
+
 # -------------------------
 # HTTP helpers
 # -------------------------
@@ -113,57 +125,6 @@ def fetch_transaction(session: requests.Session, company_slug: str, transaction_
 # Net effect calculation
 # -------------------------
 
-def extract_invoice_number(description: str) -> str:
-    """Extract invoice number from description (e.g., 'faktura #20251004777775')."""
-    import re
-    # Match patterns: "faktura #123", "faktura 123", "invoice #123"
-    match = re.search(r'faktura\s*#?(\w+)', description, re.IGNORECASE)
-    return match.group(1) if match else ""
-
-def group_by_invoice(entries: List[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
-    """Group entries by invoice number, return both groups and non-invoice entries."""
-    invoice_groups: Dict[str, List[Dict[str, Any]]] = {}
-    non_invoice_entries: List[Dict[str, Any]] = []
-    
-    for entry in entries:
-        # Skip Motlinje (reversal) entries - treat them as separate income transactions
-        if "motlinje" in entry.get("description", "").lower():
-            non_invoice_entries.append(entry)
-            continue
-            
-        invoice_num = extract_invoice_number(entry.get("description", ""))
-        if invoice_num:
-            if invoice_num not in invoice_groups:
-                invoice_groups[invoice_num] = []
-            invoice_groups[invoice_num].append(entry)
-        else:
-            non_invoice_entries.append(entry)
-    
-    return invoice_groups, non_invoice_entries
-
-def calculate_invoice_net_amount(invoice_entries: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any], bool]:
-    """Calculate net amount for an invoice group and return latest entry metadata."""
-    net_amount_ore = 0
-    has_reversals = False
-    latest_entry = None
-    
-    for je in invoice_entries:
-        # Find bank lines for this entry
-        for line in je.get("lines", []):
-            if str(line.get("account")) == BANK_ACCOUNT_CODE:
-                amount_ore = line.get("amount", 0)
-                net_amount_ore += amount_ore
-                
-                # Check if this is a reversal
-                if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
-                    has_reversals = True
-        
-        # Track the most recent entry for categorization
-        if latest_entry is None or je.get("date", "") >= latest_entry.get("date", ""):
-            latest_entry = je
-    
-    net_amount_nok = net_amount_ore / 100.0
-    return net_amount_nok, latest_entry, has_reversals
 
 # -------------------------
 # Categorization logic
@@ -190,6 +151,20 @@ def extract_relevant_accounts_from_transaction(txn: Dict[str, Any]) -> List[str]
             if acct:
                 accounts.append(acct)
     return accounts
+
+def categorize_by_transaction_type(transaction_type: str, accounts: List[str], descriptions: List[str]) -> str:
+    """
+    Categorize transaction based on its type field.
+    For Kjøp and Fri types, fall back to account-based categorization.
+    """
+    # Check if type has direct mapping
+    if transaction_type in TYPE_TO_CATEGORY:
+        category = TYPE_TO_CATEGORY[transaction_type]
+        if category is not None:
+            return category
+    
+    # For Kjøp, Fri, and unknown types, use account-based categorization
+    return categorize_outflow(accounts, descriptions)
 
 def categorize_outflow(accounts: List[str], descriptions: List[str]) -> str:
     """
@@ -244,8 +219,8 @@ def main():
     generate_full_report(session, filtered)
     generate_net_report(session, filtered)
     
-    # Generate monthly analysis report
-    generate_monthly_analysis(session, filtered)
+    # Generate monthly analysis report using transaction types
+    generate_monthly_analysis_by_type(session, filtered)
 
 def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any]]):
     """Generate full transaction report with offset information."""
@@ -348,119 +323,51 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
     out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
 
-    # Group entries by invoice number
-    print("Grouping entries by invoice number...")
-    invoice_groups, non_invoice_entries = group_by_invoice(filtered)
-    print(f"Found {len(invoice_groups)} invoice groups and {len(non_invoice_entries)} non-invoice entries")
+    # Process transactions using transaction types
+    print("Processing transactions by type...")
+    processed_transactions = set()
 
-    # Process invoice groups
-    for invoice_num, invoice_entries in invoice_groups.items():
-        net_amount, latest_entry, has_reversals = calculate_invoice_net_amount(invoice_entries)
-        
-        # Skip zero-net transactions (fully reversed)
-        if abs(net_amount) < 0.01:
-            continue
-            
-        # Get metadata from latest entry
-        date = latest_entry.get("date", "")
-        description = latest_entry.get("description", "") or ""
-        transaction_id = latest_entry.get("transactionId")
-        journal_entry_id = latest_entry.get("journalEntryId")
-        
-        # Fetch full transaction for categorization
-        txn = {}
-        expense_accounts: List[str] = []
-        descriptions: List[str] = [description]
-        try:
-            if transaction_id is not None:
-                txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
-                expense_accounts = extract_relevant_accounts_from_transaction(txn)
-                descriptions.extend([
-                    str(entry.get("description", "")) for entry in txn.get("entries", [])
-                ])
-        except Exception as e:
-            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
-
-        # Determine direction and category
-        direction = "Inflow" if net_amount > 0 else "Outflow"
-        if direction == "Inflow":
-            category = "Income"
-        else:
-            category = categorize_outflow(expense_accounts, descriptions)
-
-        # Collect all related transaction IDs
-        related_ids = sorted(set(entry.get("transactionId") for entry in invoice_entries if entry.get("transactionId")))
-        
-        rows.append({
-            "date": date,
-            "description": description,
-            "invoice_number": invoice_num,
-            "transactionId": transaction_id,
-            "journalEntryId": journal_entry_id,
-            "net_amount_nok": f"{abs(net_amount):.2f}",
-            "direction": direction,
-            "category": category,
-            "expense_accounts": ",".join(sorted(set(expense_accounts))),
-            "transaction_count": len(invoice_entries),
-            "has_reversals": "Yes" if has_reversals else "No",
-            "related_transaction_ids": ",".join(map(str, related_ids))
-        })
-
-    # Process non-invoice entries individually (salary, VAT, etc.)
-    print("Processing non-invoice entries...")
-    processed_journal_entries = set()
-    
-    for je in non_invoice_entries:
+    for je in filtered:
         journal_entry_id = je.get("journalEntryId")
         transaction_id = je.get("transactionId")
         
-        # Find bank lines for this specific journal entry
+        # Skip if we've already processed this transaction
+        if transaction_id in processed_transactions:
+            continue
+            
+        # Find bank lines for this journal entry
         bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
         if not bank_lines:
             continue
-            
-        # Process each bank line separately (for cases like salary + tax withholding)
+        
+        # Fetch transaction to get type
+        transaction_type = ""
+        try:
+            if transaction_id is not None:
+                txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                transaction_type = txn.get("type", "")
+        except Exception as e:
+            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+            continue
+        
+        # Skip cancelled transactions (but not Motlinje reversals which are income)
+        if transaction_type == "Annullering" and "motlinje" not in je.get("description", "").lower():
+            print(f"Skipping cancelled transaction {transaction_id}")
+            continue
+        
+        # Process each bank line
         for i, bline in enumerate(bank_lines):
-            # Create unique key for this bank line
-            bank_line_key = f"{journal_entry_id}_{i}"
-            if bank_line_key in processed_journal_entries:
-                continue
-                
-            # Calculate net amount for this specific bank line
             amount_ore = bline.get("amount", 0)
-            net_amount_ore = amount_ore
-            has_reversals = False
+            net_amount_nok = amount_ore / 100.0
             
-            # Check if this is a reversal
-            if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
-                has_reversals = True
-        
-            # Check for offset transactions (reversals)
-            offset_id = je.get("offsetTransactionId")
-            if offset_id:
-                # Find the offset journal entry
-                for offset_je in filtered:
-                    if offset_je.get("journalEntryId") == offset_id:
-                        offset_bank_lines = [ln for ln in offset_je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
-                        for obline in offset_bank_lines:
-                            net_amount_ore += obline.get("amount", 0)
-                        has_reversals = True
-                        break
-        
-            net_amount_nok = net_amount_ore / 100.0
-        
-            # Skip zero-net transactions (fully reversed)
+            # Skip zero amounts
             if abs(net_amount_nok) < 0.01:
                 continue
-                
-            # Get metadata from this journal entry
-            date = je.get("date", "")
-            description = je.get("description", "") or ""
             
-            # Fetch full transaction for categorization
-            txn = {}
+            # Get categorization
             expense_accounts: List[str] = []
-            descriptions: List[str] = [description]
+            descriptions: List[str] = [je.get("description", "")]
+            
             try:
                 if transaction_id is not None:
                     txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
@@ -476,17 +383,15 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             if direction == "Inflow":
                 category = "Income"
             else:
-                category = categorize_outflow(expense_accounts, descriptions)
-
-            # Collect related transaction IDs
-            related_ids = [transaction_id] if transaction_id else []
-            if offset_id:
-                related_ids.append(offset_id)
-        
+                category = categorize_by_transaction_type(transaction_type, expense_accounts, descriptions)
+            
+            # Check for reversals
+            has_reversals = "motlinje" in je.get("description", "").lower()
+            
             rows.append({
-                "date": date,
-                "description": description,
-                "invoice_number": "",  # No invoice number
+                "date": je.get("date", ""),
+                "description": je.get("description", ""),
+                "invoice_number": "",  # No longer using invoice grouping
                 "transactionId": transaction_id,
                 "journalEntryId": journal_entry_id,
                 "net_amount_nok": f"{abs(net_amount_nok):.2f}",
@@ -495,10 +400,12 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
                 "expense_accounts": ",".join(sorted(set(expense_accounts))),
                 "transaction_count": 1,
                 "has_reversals": "Yes" if has_reversals else "No",
-                "related_transaction_ids": ",".join(map(str, related_ids))
+                "related_transaction_ids": str(transaction_id) if transaction_id else ""
             })
         
-            processed_journal_entries.add(bank_line_key)
+        # Mark transaction as processed
+        if transaction_id is not None:
+            processed_transactions.add(transaction_id)
 
     # Write net CSV
     with open(out_path, "w", newline="", encoding="utf-8") as f:
@@ -554,154 +461,6 @@ def generate_summary_stats(rows: List[Dict[str, Any]]):
     print(f"{'TOTAL':<25} {total_inflow:>11.2f} {total_outflow:>11.2f} {total_inflow-total_outflow:>11.2f}")
     print("="*60)
 
-def generate_monthly_analysis(session: requests.Session, filtered: List[Dict[str, Any]]):
-    """Generate monthly analysis report showing costs by category and month."""
-    print("\nGenerating monthly analysis...")
-    
-    # Group entries by invoice number for net calculation
-    invoice_groups, non_invoice_entries = group_by_invoice(filtered)
-    
-    # Process all transactions (invoice groups + non-invoice entries)
-    monthly_data = {}
-    
-    # Process invoice groups
-    for invoice_num, invoice_entries in invoice_groups.items():
-        net_amount, latest_entry, has_reversals = calculate_invoice_net_amount(invoice_entries)
-        
-        # Skip zero-net transactions (fully reversed)
-        if abs(net_amount) < 0.01:
-            continue
-            
-        # Get month from latest entry
-        date_str = latest_entry.get("date", "")
-        if date_str:
-            month_key = date_str[:7]  # YYYY-MM format
-            
-            # Get categorization
-            transaction_id = latest_entry.get("transactionId")
-            txn = {}
-            expense_accounts: List[str] = []
-            descriptions: List[str] = [latest_entry.get("description", "")]
-            
-            try:
-                if transaction_id is not None:
-                    txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
-                    expense_accounts = extract_relevant_accounts_from_transaction(txn)
-                    descriptions.extend([
-                        str(entry.get("description", "")) for entry in txn.get("entries", [])
-                    ])
-            except Exception as e:
-                print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
-
-            # Determine direction and category
-            direction = "Inflow" if net_amount > 0 else "Outflow"
-            if direction == "Inflow":
-                category = "Income"
-            else:
-                category = categorize_outflow(expense_accounts, descriptions)
-            
-            # Add to monthly data
-            if month_key not in monthly_data:
-                monthly_data[month_key] = {}
-            if category not in monthly_data[month_key]:
-                monthly_data[month_key][category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
-            
-            if direction == "Inflow":
-                monthly_data[month_key][category]["inflow"] += abs(net_amount)
-            else:
-                monthly_data[month_key][category]["outflow"] += abs(net_amount)
-            monthly_data[month_key][category]["count"] += 1
-    
-    # Process non-invoice entries
-    processed_journal_entries = set()
-    
-    for je in non_invoice_entries:
-        journal_entry_id = je.get("journalEntryId")
-        transaction_id = je.get("transactionId")
-        
-        # Find bank lines for this specific journal entry
-        bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
-        if not bank_lines:
-            continue
-            
-        # Process each bank line separately
-        for i, bline in enumerate(bank_lines):
-            bank_line_key = f"{journal_entry_id}_{i}"
-            if bank_line_key in processed_journal_entries:
-                continue
-                
-            # Calculate net amount for this specific bank line
-            amount_ore = bline.get("amount", 0)
-            net_amount_ore = amount_ore
-            has_reversals = False
-            
-            # Check if this is a reversal
-            if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
-                has_reversals = True
-        
-            # Check for offset transactions (reversals)
-            offset_id = je.get("offsetTransactionId")
-            if offset_id:
-                for offset_je in filtered:
-                    if offset_je.get("journalEntryId") == offset_id:
-                        offset_bank_lines = [ln for ln in offset_je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
-                        for obline in offset_bank_lines:
-                            net_amount_ore += obline.get("amount", 0)
-                        has_reversals = True
-                        break
-        
-            net_amount_nok = net_amount_ore / 100.0
-        
-            # Skip zero-net transactions (fully reversed)
-            if abs(net_amount_nok) < 0.01:
-                continue
-                
-            # Get month from journal entry
-            date_str = je.get("date", "")
-            if date_str:
-                month_key = date_str[:7]  # YYYY-MM format
-                
-                # Get categorization
-                txn = {}
-                expense_accounts: List[str] = []
-                descriptions: List[str] = [je.get("description", "")]
-                
-                try:
-                    if transaction_id is not None:
-                        txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
-                        expense_accounts = extract_relevant_accounts_from_transaction(txn)
-                        descriptions.extend([
-                            str(entry.get("description", "")) for entry in txn.get("entries", [])
-                        ])
-                except Exception as e:
-                    print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
-
-                # Determine direction and category
-                direction = "Inflow" if net_amount_nok > 0 else "Outflow"
-                if direction == "Inflow":
-                    category = "Income"
-                else:
-                    category = categorize_outflow(expense_accounts, descriptions)
-                
-                # Add to monthly data
-                if month_key not in monthly_data:
-                    monthly_data[month_key] = {}
-                if category not in monthly_data[month_key]:
-                    monthly_data[month_key][category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
-                
-                if direction == "Inflow":
-                    monthly_data[month_key][category]["inflow"] += abs(net_amount_nok)
-                else:
-                    monthly_data[month_key][category]["outflow"] += abs(net_amount_nok)
-                monthly_data[month_key][category]["count"] += 1
-            
-            processed_journal_entries.add(bank_line_key)
-    
-    # Generate monthly CSV report
-    generate_monthly_csv(monthly_data)
-    
-    # Generate monthly summary
-    generate_monthly_summary(monthly_data)
 
 def generate_monthly_csv(monthly_data: Dict[str, Dict[str, Dict[str, Any]]]):
     """Generate CSV file with monthly breakdown by category."""
@@ -806,6 +565,100 @@ def generate_monthly_summary(monthly_data: Dict[str, Dict[str, Dict[str, Any]]])
     
     print(f"{grand_total:>9.2f}")
     print("="*80)
+
+def generate_monthly_analysis_by_type(session: requests.Session, filtered: List[Dict[str, Any]]):
+    """Generate monthly analysis using transaction types instead of invoice grouping."""
+    print("\nGenerating monthly analysis by transaction type...")
+    
+    monthly_data = {}
+    processed_transactions = set()
+    
+    for je in filtered:
+        journal_entry_id = je.get("journalEntryId")
+        transaction_id = je.get("transactionId")
+        
+        # Skip if we've already processed this transaction
+        if transaction_id in processed_transactions:
+            continue
+            
+        # Find bank lines for this journal entry
+        bank_lines = [ln for ln in je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
+        if not bank_lines:
+            continue
+        
+        # Fetch transaction to get type
+        transaction_type = ""
+        try:
+            if transaction_id is not None:
+                txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                transaction_type = txn.get("type", "")
+        except Exception as e:
+            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+            continue
+        
+        # Skip cancelled transactions (but not Motlinje reversals which are income)
+        if transaction_type == "Annullering" and "motlinje" not in je.get("description", "").lower():
+            print(f"Skipping cancelled transaction {transaction_id}")
+            continue
+        
+        # Process each bank line
+        for i, bline in enumerate(bank_lines):
+            amount_ore = bline.get("amount", 0)
+            net_amount_nok = amount_ore / 100.0
+            
+            # Skip zero amounts
+            if abs(net_amount_nok) < 0.01:
+                continue
+            
+            # Get month from journal entry
+            date_str = je.get("date", "")
+            if not date_str:
+                continue
+                
+            month_key = date_str[:7]  # YYYY-MM format
+            
+            # Get categorization
+            expense_accounts: List[str] = []
+            descriptions: List[str] = [je.get("description", "")]
+            
+            try:
+                if transaction_id is not None:
+                    txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                    expense_accounts = extract_relevant_accounts_from_transaction(txn)
+                    descriptions.extend([
+                        str(entry.get("description", "")) for entry in txn.get("entries", [])
+                    ])
+            except Exception as e:
+                print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+
+            # Determine direction and category
+            direction = "Inflow" if net_amount_nok > 0 else "Outflow"
+            if direction == "Inflow":
+                category = "Income"
+            else:
+                category = categorize_by_transaction_type(transaction_type, expense_accounts, descriptions)
+            
+            # Add to monthly data
+            if month_key not in monthly_data:
+                monthly_data[month_key] = {}
+            if category not in monthly_data[month_key]:
+                monthly_data[month_key][category] = {"inflow": 0.0, "outflow": 0.0, "count": 0}
+            
+            if direction == "Inflow":
+                monthly_data[month_key][category]["inflow"] += abs(net_amount_nok)
+            else:
+                monthly_data[month_key][category]["outflow"] += abs(net_amount_nok)
+            monthly_data[month_key][category]["count"] += 1
+        
+        # Mark transaction as processed
+        if transaction_id is not None:
+            processed_transactions.add(transaction_id)
+    
+    # Generate monthly CSV report
+    generate_monthly_csv(monthly_data)
+    
+    # Generate monthly summary
+    generate_monthly_summary(monthly_data)
 
 if __name__ == "__main__":
     try:
