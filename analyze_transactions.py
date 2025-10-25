@@ -303,8 +303,14 @@ def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any
 
     print(f"Full report: Wrote {len(rows)} rows to {out_path}")
 
+def extract_invoice_number(description: str) -> str:
+    """Extract invoice number from description (e.g., 'faktura #20251004777775')."""
+    import re
+    match = re.search(r'faktura\s*#?(\w+)', description, re.IGNORECASE)
+    return match.group(1) if match else ""
+
 def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]]):
-    """Generate net transaction report using invoice-based grouping."""
+    """Generate net transaction report using transaction types."""
     fieldnames = [
         "date",
         "description",
@@ -324,6 +330,7 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
     # Process transactions using transaction types
     print("Processing transactions by type...")
     processed_transactions = set()
+    processed_invoices = set()  # Track processed invoices to avoid duplicates
 
     for je in filtered:
         journal_entry_id = je.get("journalEntryId")
@@ -385,6 +392,15 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             
             # Check for reversals
             has_reversals = "motlinje" in je.get("description", "").lower()
+            
+            # Check for invoice deduplication
+            invoice_num = extract_invoice_number(je.get("description", ""))
+            if invoice_num and invoice_num in processed_invoices:
+                print(f"Skipping duplicate invoice {invoice_num}")
+                continue
+            
+            if invoice_num:
+                processed_invoices.add(invoice_num)
             
             rows.append({
                 "date": je.get("date", ""),
