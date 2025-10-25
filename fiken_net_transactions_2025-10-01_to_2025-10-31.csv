@@ -12,7 +12,7 @@ date,description,transactionId,journalEntryId,transaction_type,net_amount_nok,di
 2025-10-13,Fra: 1813.06.83343 med KID: 0000100750,10588134132,10692584452,Salg,7200.00,Inflow,Income,"1500:10009,2701,3026",No
 2025-10-14,Fra: 1080.62.10205 med KID: 0000100768,10606873172,10699059980,Salg,8791.50,Inflow,Income,"1500:10006,2701,3026",No
 2025-10-14,Fra: 1080.62.10205 med KID: 0000100776,10640861474,10699059981,Salg,9849.02,Inflow,Income,"1500:10006,2701,3090",No
-2025-10-31,Betaling sendt med betalingsfil fra kontonummer 15201207727 til kontonummer 15065648188 med kid/melding ,10714189433,10714204374,Kjøp,19512.06,Outflow,ADK,"2400:20024,2711,6795",No
+2025-10-31,Betaling sendt med betalingsfil fra kontonummer 15201207727 til kontonummer 15065648188 med kid/melding ,10714189433,10714204374,Kjøp,19512.06,Outflow,Personalkostnader,"2400:20024,2711,6795",No
 2025-10-06,Betaling  (faktura #20251004777775),10714529141,10714520460,Kjøp,34783.25,Outflow,Programvare og datasystemer,"2400:20024,2702,2712,6553,8160",No
 2025-10-16,Betaling  (faktura #3NAEIG1I-0001),10714529254,10714520625,Kjøp,155.94,Outflow,Programvare og datasystemer,"2400:20036,2702,2712,6553,8160",No
 2025-10-06,Betaling  (faktura #JAQTYPH9-0002),10714529302,10714520693,Kjøp,296.68,Outflow,Programvare og datasystemer,"2400:20024,2702,2712,6553,8160",No
