@@ -30,8 +30,6 @@ DATE_TO = "2025-10-10"
 # Bank account to inspect
 BANK_ACCOUNT_CODE = "1920:10001"
 
-# Output CSV path
-OUTPUT_CSV = f"fiken_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
 
 # Category rules
 PERSONAL_KOSTNADS_ACCOUNTS = set(["5001","5092","5401","5405","5901","5950","2771","2400:20024"])  # includes AP subaccount Fjellestad AS
@@ -114,56 +112,6 @@ def fetch_transaction(session: requests.Session, company_slug: str, transaction_
 # -------------------------
 # Net effect calculation
 # -------------------------
-def build_transaction_graph(entries: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    Build a graph of transactions and their offsets using offsetTransactionId.
-    Returns a mapping of transaction_id -> list of related journal entries.
-    """
-    transaction_map: Dict[int, List[Dict[str, Any]]] = {}
-    
-    for entry in entries:
-        transaction_id = entry.get("transactionId")
-        offset_id = entry.get("offsetTransactionId")
-        
-        if transaction_id is not None:
-            if transaction_id not in transaction_map:
-                transaction_map[transaction_id] = []
-            transaction_map[transaction_id].append(entry)
-        
-        # Also add to offset transaction if it exists
-        if offset_id is not None:
-            if offset_id not in transaction_map:
-                transaction_map[offset_id] = []
-            transaction_map[offset_id].append(entry)
-    
-    return transaction_map
-
-def calculate_net_amount(transaction_id: int, transaction_map: Dict[int, List[Dict[str, Any]]]) -> Tuple[float, List[Dict[str, Any]], bool]:
-    """
-    Calculate net amount for a transaction by considering all related entries.
-    Returns: (net_amount_nok, all_related_entries, has_reversals)
-    """
-    if transaction_id not in transaction_map:
-        return 0.0, [], False
-    
-    related_entries = transaction_map[transaction_id]
-    net_amount_ore = 0
-    has_reversals = False
-    
-    for entry in related_entries:
-        # Find bank line for this entry
-        for line in entry.get("lines", []):
-            if str(line.get("account")) == BANK_ACCOUNT_CODE:
-                amount_ore = line.get("amount", 0)
-                net_amount_ore += amount_ore
-                
-                # Check if this is a reversal (negative amount or "Motlinje" description)
-                if amount_ore < 0 or "motlinje" in entry.get("description", "").lower():
-                    has_reversals = True
-                break
-    
-    net_amount_nok = net_amount_ore / 100.0
-    return net_amount_nok, related_entries, has_reversals
 
 def extract_invoice_number(description: str) -> str:
     """Extract invoice number from description (e.g., 'faktura #20251004777775')."""
@@ -287,16 +235,11 @@ def main():
                 break
     print(f"Kept {len(filtered)} entries hitting account {BANK_ACCOUNT_CODE}.")
 
-    # Build transaction graph for net effect calculation
-    print("Building transaction relationship graph...")
-    transaction_map = build_transaction_graph(filtered)
-    print(f"Found {len(transaction_map)} unique transactions.")
-
     # Generate both full and net transaction reports
-    generate_full_report(session, filtered, transaction_map)
-    generate_net_report(session, filtered, transaction_map)
+    generate_full_report(session, filtered)
+    generate_net_report(session, filtered)
 
-def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any]], transaction_map: Dict[int, List[Dict[str, Any]]]):
+def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any]]):
     """Generate full transaction report with offset information."""
     fieldnames = [
         "date",
@@ -342,8 +285,8 @@ def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any
 
         # Check if this transaction has reversals
         has_reversals = False
-        if transaction_id is not None:
-            _, _, has_reversals = calculate_net_amount(transaction_id, transaction_map)
+        if "motlinje" in description.lower():
+            has_reversals = True
 
         # Emit one row per bank line
         for bline in bank_lines:
@@ -377,7 +320,7 @@ def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any
 
     print(f"Full report: Wrote {len(rows)} rows to {out_path}")
 
-def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]], transaction_map: Dict[int, List[Dict[str, Any]]]):
+def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]]):
     """Generate net transaction report using invoice-based grouping."""
     fieldnames = [
         "date",
