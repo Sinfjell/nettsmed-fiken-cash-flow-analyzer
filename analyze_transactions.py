@@ -168,12 +168,14 @@ def calculate_net_amount(transaction_id: int, transaction_map: Dict[int, List[Di
 def extract_invoice_number(description: str) -> str:
     """Extract invoice number from description (e.g., 'faktura #20251004777775')."""
     import re
-    match = re.search(r'faktura\s*#?(\d+)', description, re.IGNORECASE)
+    # Match patterns: "faktura #123", "faktura 123", "invoice #123"
+    match = re.search(r'faktura\s*#?(\w+)', description, re.IGNORECASE)
     return match.group(1) if match else ""
 
-def group_by_invoice(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    """Group entries by invoice number as fallback for offsetTransactionId."""
+def group_by_invoice(entries: List[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    """Group entries by invoice number, return both groups and non-invoice entries."""
     invoice_groups: Dict[str, List[Dict[str, Any]]] = {}
+    non_invoice_entries: List[Dict[str, Any]] = []
     
     for entry in entries:
         invoice_num = extract_invoice_number(entry.get("description", ""))
@@ -181,8 +183,34 @@ def group_by_invoice(entries: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, 
             if invoice_num not in invoice_groups:
                 invoice_groups[invoice_num] = []
             invoice_groups[invoice_num].append(entry)
+        else:
+            non_invoice_entries.append(entry)
     
-    return invoice_groups
+    return invoice_groups, non_invoice_entries
+
+def calculate_invoice_net_amount(invoice_entries: List[Dict[str, Any]]) -> Tuple[float, Dict[str, Any], bool]:
+    """Calculate net amount for an invoice group and return latest entry metadata."""
+    net_amount_ore = 0
+    has_reversals = False
+    latest_entry = None
+    
+    for je in invoice_entries:
+        # Find bank lines for this entry
+        for line in je.get("lines", []):
+            if str(line.get("account")) == BANK_ACCOUNT_CODE:
+                amount_ore = line.get("amount", 0)
+                net_amount_ore += amount_ore
+                
+                # Check if this is a reversal
+                if amount_ore < 0 or "motlinje" in je.get("description", "").lower():
+                    has_reversals = True
+        
+        # Track the most recent entry for categorization
+        if latest_entry is None or je.get("date", "") >= latest_entry.get("date", ""):
+            latest_entry = je
+    
+    net_amount_nok = net_amount_ore / 100.0
+    return net_amount_nok, latest_entry, has_reversals
 
 # -------------------------
 # Categorization logic
@@ -350,26 +378,88 @@ def generate_full_report(session: requests.Session, filtered: List[Dict[str, Any
     print(f"Full report: Wrote {len(rows)} rows to {out_path}")
 
 def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]], transaction_map: Dict[int, List[Dict[str, Any]]]):
-    """Generate net transaction report showing only net effects."""
+    """Generate net transaction report using invoice-based grouping."""
     fieldnames = [
         "date",
         "description",
+        "invoice_number",
         "transactionId",
         "journalEntryId", 
         "net_amount_nok",
         "direction",
         "category",
         "expense_accounts",
+        "transaction_count",
         "has_reversals",
         "related_transaction_ids"
     ]
     
     out_path = f"fiken_net_transactions_{DATE_FROM}_to_{DATE_TO}.csv"
     rows = []
-    processed_journal_entries = set()
 
-    # Process each journal entry with bank lines individually
-    for je in filtered:
+    # Group entries by invoice number
+    print("Grouping entries by invoice number...")
+    invoice_groups, non_invoice_entries = group_by_invoice(filtered)
+    print(f"Found {len(invoice_groups)} invoice groups and {len(non_invoice_entries)} non-invoice entries")
+
+    # Process invoice groups
+    for invoice_num, invoice_entries in invoice_groups.items():
+        net_amount, latest_entry, has_reversals = calculate_invoice_net_amount(invoice_entries)
+        
+        # Skip zero-net transactions (fully reversed)
+        if abs(net_amount) < 0.01:
+            continue
+            
+        # Get metadata from latest entry
+        date = latest_entry.get("date", "")
+        description = latest_entry.get("description", "") or ""
+        transaction_id = latest_entry.get("transactionId")
+        journal_entry_id = latest_entry.get("journalEntryId")
+        
+        # Fetch full transaction for categorization
+        txn = {}
+        expense_accounts: List[str] = []
+        descriptions: List[str] = [description]
+        try:
+            if transaction_id is not None:
+                txn = fetch_transaction(session, FIKEN_COMPANY_SLUG, int(transaction_id))
+                expense_accounts = extract_relevant_accounts_from_transaction(txn)
+                descriptions.extend([
+                    str(entry.get("description", "")) for entry in txn.get("entries", [])
+                ])
+        except Exception as e:
+            print(f"Warning: failed to fetch transaction {transaction_id}: {e}", file=sys.stderr)
+
+        # Determine direction and category
+        direction = "Inflow" if net_amount > 0 else "Outflow"
+        if direction == "Inflow":
+            category = "Income"
+        else:
+            category = categorize_outflow(expense_accounts, descriptions)
+
+        # Collect all related transaction IDs
+        related_ids = sorted(set(entry.get("transactionId") for entry in invoice_entries if entry.get("transactionId")))
+        
+        rows.append({
+            "date": date,
+            "description": description,
+            "invoice_number": invoice_num,
+            "transactionId": transaction_id,
+            "journalEntryId": journal_entry_id,
+            "net_amount_nok": f"{abs(net_amount):.2f}",
+            "direction": direction,
+            "category": category,
+            "expense_accounts": ",".join(sorted(set(expense_accounts))),
+            "transaction_count": len(invoice_entries),
+            "has_reversals": "Yes" if has_reversals else "No",
+            "related_transaction_ids": ",".join(map(str, related_ids))
+        })
+
+    # Process non-invoice entries individually (salary, VAT, etc.)
+    print("Processing non-invoice entries...")
+    processed_journal_entries = set()
+    
+    for je in non_invoice_entries:
         journal_entry_id = je.get("journalEntryId")
         transaction_id = je.get("transactionId")
         
@@ -401,7 +491,6 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
                 for offset_je in filtered:
                     if offset_je.get("journalEntryId") == offset_id:
                         offset_bank_lines = [ln for ln in offset_je.get("lines", []) if str(ln.get("account")) == BANK_ACCOUNT_CODE]
-                        # For now, add all offset bank lines (could be improved to match specific lines)
                         for obline in offset_bank_lines:
                             net_amount_ore += obline.get("amount", 0)
                         has_reversals = True
@@ -446,12 +535,14 @@ def generate_net_report(session: requests.Session, filtered: List[Dict[str, Any]
             rows.append({
                 "date": date,
                 "description": description,
+                "invoice_number": "",  # No invoice number
                 "transactionId": transaction_id,
                 "journalEntryId": journal_entry_id,
                 "net_amount_nok": f"{abs(net_amount_nok):.2f}",
                 "direction": direction,
                 "category": category,
                 "expense_accounts": ",".join(sorted(set(expense_accounts))),
+                "transaction_count": 1,
                 "has_reversals": "Yes" if has_reversals else "No",
                 "related_transaction_ids": ",".join(map(str, related_ids))
             })
